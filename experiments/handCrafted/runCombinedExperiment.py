@@ -1,0 +1,199 @@
+import os
+import sys
+import numpy
+import pickle
+import sklearn.cluster
+import sklearn.ensemble
+
+#Path to open CV library
+cvPath = "/scratch/georgioutk/opencv/install/lib/python3.6/dist-packages"
+#Results folder
+descriptor = "HL_SURF/"
+sys.path.append(cvPath)
+import cv2
+import preprocessing
+from matplotlib import pyplot as plt
+
+print("Loading Data")
+try:
+	trainSet = numpy.load("trainSetInUint8.npy")
+	trainLabels = numpy.load(preprocessing.trainLabelPath).astype(numpy.float32)
+except FileNotFoundError:
+	trainSet, trainLabels = preprocessing.loadTrainSet()
+	numpy.save("trainSetInUint8.npy", trainSet)
+
+try:
+	testSet = numpy.load("testSetInUint8.npy")
+	testLabels = numpy.load(preprocessing.testLabelPath).astype(numpy.float32)
+except FileNotFoundError:
+	testSet, testLabels = preprocessing.loadTestSet()
+	numpy.save("testSetInUint8.npy", testSet)
+
+#Choose detector and descriptor
+
+# surf = cv2.ORB_create()
+# surf.setFastThreshold(0)
+# surf.setEdgeThreshold(0)
+surf = cv2.xfeatures2d.SURF_create()
+# surf = cv2.xfeatures2d.SIFT_create()
+# det = cv2.xfeatures2d.SIFT_create()
+# det = cv2.xfeatures2d.HarrisLaplaceFeatureDetector_create()
+# det = cv2.AgastFeatureDetector_create()
+# det = cv2.ORB_create()
+# det.setFastThreshold(0)
+# det.setEdgeThreshold(0)
+det = cv2.xfeatures2d.HarrisLaplaceFeatureDetector_create()
+
+# det = cv2.xfeatures2d.StarDetector_create()
+
+
+print("Extracting train features")
+try:
+	print("Loading")
+	descriptors = pickle.load(open(descriptor+"combinedTrainDescriptors.pkl", "rb"))
+	# descriptors = numpy.concatenate(descriptors, axis=0)
+except FileNotFoundError:
+	count = 0
+	descriptors = []
+	for im in trainSet:
+		count += 1
+		if count % 100 == 0:
+			print(count/15000, end="\r", flush=True)
+		kp = det.detect(im[:,:,0])
+		for i in range(1,5):
+			nkp = det.detect(im[:,:,i])
+			toGo = []
+			for k in range(len(nkp)):
+				for kk in kp:
+					if kk.overlap(kk, nkp[k]) > 0.9:
+						toGo.append(k)
+						break
+			for k in toGo[::-1]:
+				del(nkp[k])
+			kp += nkp
+		descs = []
+		if len(kp) == 0:
+			continue
+		for i in range(5):
+			d = surf.compute(im[:,:,i], kp)[1]
+			descs.append(d)
+		descs = numpy.concatenate(descs, axis=1)
+		descriptors.append(descs)
+	descriptors = numpy.concatenate(descriptors, axis=0)
+	pickle.dump(descriptors, open(descriptor+"combinedTrainDescriptors.pkl", "wb"))
+
+#Number of words for BoW model
+nWords = 2048
+print("Creating dictionary")
+if len(descriptors)>1e5:
+	allDescs = numpy.concatenate(descriptors[:1e5], axis=0)
+else:
+	allDescs = numpy.concatenate(descriptors, axis=0)
+
+try:
+	dictionary = pickle.load(open(descriptor+"combinedDictionary_"+str(nWords)+".pkl", "rb"))
+except FileNotFoundError:
+	km = sklearn.cluster.KMeans(n_clusters=nWords, n_init=1, max_iter=3000, n_jobs=64)
+	dictionary = km.fit(allDescs)
+	pickle.dump(dictionary, open(descriptor+"combinedDictionary_"+str(nWords)+".pkl", "wb"))
+
+del allDescs
+
+
+#Version 1
+# print("Extracting train descriptors")
+# wrTrain = numpy.zeros([trainSet.shape[0], nWords])
+# count = 0
+# for im in trainSet:
+# 	if count % 100 == 0:
+# 		print(count/15000, end="\r", flush=True)
+# 	kp = det.detect(im[:,:,0])
+# 	for i in range(1,5):
+# 		nkp = det.detect(im[:,:,i])
+# 		toGo = []
+# 		for k in range(len(nkp)):
+# 			for kk in kp:
+# 				if kk.overlap(kk, nkp[k]) > 0.9:
+# 					toGo.append(k)
+# 					break
+# 		for k in toGo[::-1]:
+# 			del(nkp[k])
+# 		kp += nkp
+# 	descs = []
+# 	if len(kp) == 0: continue
+# 	for i in range(5):
+# 		descs.append(surf.compute(im[:,:,i], kp)[1])
+# 	descs = numpy.concatenate(descs, axis=1)
+# 	wIndexes = dictionary.predict(descs)
+# 	wrTrain[count, wIndexes] += 1
+# 	count += 1
+
+#Version 2
+print("Extracting train descriptors")
+wrTrain = numpy.zeros([trainSet.shape[0], nWords])
+count = 0
+for im in descriptors:
+	if count % 100 == 0:
+		print(count/15000, end="\r", flush=True)
+	wIndexes = dictionary.predict(im)
+	wrTrain[count, wIndexes] += 1
+	count += 1
+
+print("Train to tf.idf")
+summTrain = numpy.sum(wrTrain, axis=1, keepdims=True)
+summTrain[numpy.where(summTrain==0)] = 1
+tfTrain = wrTrain/summTrain
+wSumTrain = numpy.sum(wrTrain, axis=0, keepdims=True)
+wSumTrain[numpy.where(wSumTrain==0)] = 1
+idf = numpy.log(wrTrain.shape[0]/wSumTrain)
+tfIdfTrain = tfTrain*idf
+
+# tfTrain = wrTrain/numpy.sum(wrTrain, axis=1, keepdims=True)
+# idf = numpy.log(wrTrain.shape[0]/numpy.sum(wrTrain, axis=0, keepdims=True))
+# tfIdfTrain = tfTrain*idf
+
+print("Extracting test descriptors")
+wrTest = numpy.zeros([testSet.shape[0], nWords])
+count = 0
+for im in testSet:
+	if count % 100 == 0:
+		print(count/1000, end="\r", flush=True)
+	kp = det.detect(im[:,:,0])
+	for i in range(1,5):
+		nkp = det.detect(im[:,:,i])
+		toGo = []
+		for k in range(len(nkp)):
+			for kk in kp:
+				if kk.overlap(kk, nkp[k]) > 0.9:
+					toGo.append(k)
+					break
+		for k in toGo[::-1]:
+			del(nkp[k])
+		kp += nkp
+	descs = []
+	if len(kp) == 0:
+		exit("Test example with no keypoints")
+	for i in range(5):
+		descs.append(surf.compute(im[:,:,i], kp)[1])
+	descs = numpy.concatenate(descs, axis=1)
+	wIndexes = dictionary.predict(descs)
+	wrTest[count, wIndexes] += 1
+	count += 1
+
+print("Test to tf.idf")
+tfTest = wrTest/numpy.sum(wrTest, axis=1, keepdims=True)
+tfIdfTest = tfTest*idf
+
+print("Training Random Forests")
+rf = sklearn.ensemble.RandomForestRegressor(n_jobs=60)
+rf.fit(tfIdfTrain, trainLabels)
+
+print("Predicting")
+preds = rf.predict(tfIdfTest)
+
+diff = numpy.square(preds-testLabels)
+mean = numpy.sqrt(numpy.mean(diff, axis=0))
+
+log = open(descriptor+"combined_"+str(nWords)+".acc", "w")
+print("Performance")
+print(mean, file=log)
